@@ -1,0 +1,225 @@
+sudo mysql -u root -e "CREATE DATABASE IF NOT EXISTS 397HW4;"
+sudo mysql -u root -e "CREATE USER IF NOT EXISTS 'user'@'localhost' IDENTIFIED BY 'ozzy523';"
+sudo mysql -u root -e "GRANT ALL PRIVILEGES ON 397HW4.* TO 'user'@'localhost';"
+sudo mysql -u root -e "FLUSH PRIVILEGES;"
+
+
+sudo mysql -u root -e "CREATE TABLE IF NOT EXISTS 397HW4.employees (
+    EmployeeID INT,
+    Name VARCHAR(255),
+    Age INT,
+    Department VARCHAR(100),
+    Start_Date DATE,
+    Years_of_Experience INT,
+    Country VARCHAR(100),
+    Salary FLOAT,
+    Performance_Rating VARCHAR(100)
+);"
+
+sudo mysql -u root -e SET GLOBAL local_infile = 1;
+
+## Ingest the data using native functionality.
+sudo mysql -u root -e "LOAD DATA LOCAL INFILE '/Users/ananyakotian/Downloads/employee_data_clean (1).csv'
+                INTO TABLE 397HW4.employees FIELDS TERMINATED BY ',' 
+                LINES TERMINATED BY '\n' IGNORE 1 ROWS
+                (EmployeeID, Name, Age, Department, Start_Date, Years_of_Experience, Country, Salary, Performance_Rating);"
+
+## Ensure the data was ingested as expected.
+sudo mysql -u root -e "SELECT * FROM 397HW4.employees"
+
+# Setting up Airflow and initializing it.
+pip install apache-airflow apache-airflow-providers-mysql
+airflow db init
+
+# Set up the MySQL connection in Airflow. This connects Airflow to our MySQL db.
+airflow connections add 'HW4' \
+    --conn-type 'mysql' \
+    --conn-host '127.0.0.1' \
+    --conn-login 'user' \
+    --conn-password 'ozzy523' \
+    --conn-schema '397HW4' \
+    --conn-port 3306
+
+# Create webserver_config.py and disable CSRF and authentication since this is a demo project.
+cat > $HOME/airflow/webserver_config.py << EOF
+WTF_CSRF_ENABLED = False
+WTF_CSRF_TIME_LIMIT = None
+AUTH_ROLE_PUBLIC = 'Admin'
+EOF
+
+# Disable loading default demo DAGs.
+sed -i '' 's/load_examples = True/load_examples = false/g' $HOME/airflow/airflow.cfg
+
+# Create the DAG directory if it doesnt exist, so we can lod our DAG.
+AIRFLOW_DAG_PATH="$HOME/airflow/dags"
+mkdir -p $AIRFLOW_DAG_PATH
+
+# Write the Airflow DAG to the DAGS location.
+cat > $AIRFLOW_DAG_PATH/employee_data_transformations.py << EOF
+from airflow import DAG
+from airflow.providers.common.sql.operators.sql import (SQLExecuteQueryOperator, SQLTableCheckOperator)
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators.bash_operator import BashOperator
+from datetime import datetime, timedelta
+
+employee_data_transformations = DAG(
+     dag_id="employee_data_transformations",
+     start_date=datetime(1990, 1, 1),
+     schedule="@daily",
+     catchup=False,
+     default_args={
+        'retries': 3,
+        'retry_delay': timedelta(seconds=5),
+        'max_retry_delay': timedelta(minutes=5),
+        'retry_exponential_backoff': False,
+    }
+ )
+
+is_data_available = SQLTableCheckOperator(
+    task_id='is_data_available',
+    table="397HW4.employees",
+    checks={
+            "row_count_check": {
+                "check_statement": "COUNT(*) > 0",
+            }
+        },
+    conn_id='HW4',
+    dag=employee_data_transformations,
+)
+
+num_performance_rating = SQLExecuteQueryOperator(
+    task_id='num_performance_rating_rename_column',
+    sql="""ALTER TABLE 397HW4.employees ADD COLUMN New_Performance_Rating INT;""",
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+
+update_performance_rating = SQLExecuteQueryOperator(
+    task_id='update_performance_rating',
+    sql="""UPDATE 397HW4.employees
+            SET New_Performance_Rating =
+                CASE 
+                    WHEN Performance_Rating LIKE '%Low Performers%' THEN 1
+                    WHEN Performance_Rating LIKE '%Average Performers%' THEN 2
+                    WHEN Performance_Rating LIKE '%High Performers%' THEN 3
+                    ELSE NULL
+                END;""",
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+
+drop_old_performance_column = SQLExecuteQueryOperator(
+    task_id='drop_old_performance_column',
+    sql="""ALTER TABLE 397HW4.employees DROP COLUMN Performance_Rating;""",
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+
+rename_new_column = SQLExecuteQueryOperator(
+    task_id='rename_new_column',
+    sql="""ALTER TABLE 397HW4.employees RENAME COLUMN New_Performance_Rating TO Performance_Rating;""",
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+
+is_data_available >> num_performance_rating >> update_performance_rating >> drop_old_performance_column >> rename_new_column
+
+salary_to_department_analysis = SQLExecuteQueryOperator(
+    task_id='salary_to_department_analysis',
+    sql="""DROP TABLE IF EXISTS 397HW4.salary_to_department_analysis;
+            CREATE TABLE 397HW4.salary_to_department_analysis AS
+            SELECT Department, AVG(Salary) AS Avg_Salary
+            FROM employees
+            GROUP BY Department;
+        """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+is_data_available >> salary_to_department_analysis
+
+salary_to_tenuere_analysis = SQLExecuteQueryOperator(
+    task_id='salary_to_tenuere_analysis',
+    sql="""DROP TABLE IF EXISTS 397HW4.salary_to_tenuere_analysis;
+            CREATE TABLE 397HW4.salary_to_tenuere_analysis AS
+            SELECT Years_of_Experience, AVG(Salary) AS Avg_Salary
+            FROM employees
+            GROUP BY Years_of_Experience
+            ORDER BY Years_of_Experience;
+            """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+is_data_available >> salary_to_tenuere_analysis
+
+
+performance_by_salary_analysis = SQLExecuteQueryOperator(
+    task_id='performance_by_salary_analysis',
+    sql=""" DROP TABLE IF EXISTS 397HW4.performance_by_salary_analysis;
+            CREATE TABLE 397HW4.performance_by_salary_analysis AS
+            SELECT Performance_Rating, AVG(Salary) AS Avg_Salary
+            FROM employees
+            GROUP BY Performance_Rating
+            ORDER BY Performance_Rating;
+        """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+rename_new_column >> performance_by_salary_analysis
+
+experience_by_age = SQLExecuteQueryOperator(
+    task_id='experience_by_age',
+    sql=""" DROP TABLE IF EXISTS 397HW4.experience_by_age;
+            CREATE TABLE 397HW4.experience_by_age AS
+            SELECT Age, AVG(Years_of_Experience) AS Avg_Years_of_Experience
+            FROM employees
+            GROUP BY Age ORDER BY Age;
+        """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+is_data_available >> experience_by_age
+
+department_by_country = SQLExecuteQueryOperator(
+    task_id='department_by_country',
+    sql=""" DROP TABLE IF EXISTS 397HW4.department_by_country;
+            CREATE TABLE 397HW4.department_by_country AS
+            SELECT r.Country, r.Department, r.Employees
+            FROM (
+                SELECT Country, Department, COUNT(*) AS Employees, MAX(COUNT(*)) OVER (PARTITION BY Country) as MaxEmployees
+                FROM 397HW4.employees
+                GROUP BY Country, Department
+            ) as r
+            WHERE r.Employees = r.MaxEmployees;
+        """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+is_data_available >> department_by_country
+
+experience_by_performance = SQLExecuteQueryOperator(
+    task_id='experience_by_performance',
+    sql=""" DROP TABLE IF EXISTS 397HW4.experience_by_performance;
+            CREATE TABLE 397HW4.experience_by_performance AS
+            SELECT Performance_Rating, AVG(Years_of_Experience) AS Avg_Years_of_Experience
+            FROM employees
+            GROUP BY Performance_Rating
+            ORDER BY Performance_Rating;
+        """,
+    conn_id='HW4',
+    autocommit=True,
+    dag=employee_data_transformations,
+)
+rename_new_column >> experience_by_performance
+EOF
+
+## Start Airflow scheduler and webserver.
+airflow scheduler & airflow webserver
